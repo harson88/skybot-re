@@ -1,0 +1,102 @@
+name: 🤖 Skybot 续期
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 14 */2 * *' # 每两天运行一次
+
+jobs:
+  run_renewal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # 增加超时时间以容纳多账号
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 📦 安装底层依赖与浏览器
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool
+          python -m pip install --upgrade pip
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: 🛡️ 启动 GOST 代理隧道
+        env:
+          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+        run: |
+          if [ -z "$GOST_PROXY" ]; then 
+            echo "未配置代理，跳过此步骤。"
+            exit 0
+          fi
+          wget -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz
+          gunzip gost-linux-amd64-2.11.5.gz
+          chmod +x gost-linux-amd64-2.11.5
+          nohup ./gost-linux-amd64-2.11.5 -L :8080 -F "$GOST_PROXY" > gost.log 2>&1 &
+          sleep 5
+          echo "PROXY_URL=socks5://127.0.0.1:8080" >> $GITHUB_ENV
+
+      - name: 🚀 循环执行多账号续期
+        env:
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ env.PROXY_URL }} # 继承上一步的代理
+        run: |
+          # 使用 Python 内联脚本驱动循环，调用 xvfb-run
+          python3 -c "
+          import os, json, subprocess, time
+
+          try:
+              accounts = json.loads(os.environ.get('ACCOUNTS_JSON', '[]'))
+          except Exception as e:
+              print(f'❌ JSON 配置解析失败: {e}')
+              exit(1)
+
+          if not accounts:
+              print('⚠️ 未检测到账号列表，请检查 Secrets 配置。')
+              exit(1)
+
+          print(f'ℹ️ 检测到 {len(accounts)} 个待处理账号\n')
+
+          for i, acc in enumerate(accounts, 1):
+              user = acc.get('u')
+              pwd = acc.get('p')
+              
+              print(f'▶️ [{i}/{len(accounts)}] 正在处理账号: {user}')
+              
+              # 构建当前账号的环境变量
+              current_env = os.environ.copy()
+              current_env['SKYBOTS_ACCOUNT'] = user
+              current_env['SKYBOTS_PASSWORD'] = pwd
+
+              # 执行命令：为每个账号开启独立的 xvfb 虚拟屏幕
+              # 注意：脚本名必须与仓库中的文件名一致
+              try:
+                  subprocess.run(['xvfb-run', '-a', 'python3', 'app.py'], env=current_env)
+              except Exception as e:
+                  print(f'❌ 账号 {user} 执行异常: {e}')
+
+              # 账号间冷却，降低 IP 触发风控的概率
+              if i < len(accounts):
+                  print('⏳ 等待 15 秒后处理下一个...')
+                  time.sleep(15)
+
+          print('\n🎉 所有任务执行完毕！')
+          "
+
+      - name: 🧹 清理旧记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          keep_minimum_runs: 5
